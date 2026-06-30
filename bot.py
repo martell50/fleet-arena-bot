@@ -1,15 +1,16 @@
 """
-SWGOH Fleet Arena Attack Notifier Bot — v4
+SWGOH Fleet Arena Attack Notifier Bot — v5
 -------------------------------------------
-Polls /playerArena every 30 seconds (fleet arena only, tab == 2).
-When your rank drops, identifies the attacker as whoever is now
-sitting at your old rank in the leaderboard entries.
-Since fleet arena battles take at least 2 minutes, the attacker
-is guaranteed to still be there on the next poll.
+Since /playerArena does not return opponent/leaderboard data on this
+Comlink instance, this version maintains its own local rank table by
+polling /player for a known list of ally codes (the top 50 of your
+fleet shard) every 30 seconds, alongside your own /playerArena rank.
+
+When your rank drops, the attacker is identified directly from this
+local table — whoever is now sitting at your old rank.
 """
 
 import os
-import json
 import asyncio
 import aiohttp
 import discord
@@ -19,10 +20,72 @@ from discord.ext import tasks
 #  CONFIGURATION  (set these as env variables)
 # ─────────────────────────────────────────────
 COMLINK_URL   = os.environ.get("COMLINK_URL",   "https://comlink.andeh.uk")
-ALLY_CODE     = os.environ.get("ALLY_CODE",     "")
+ALLY_CODE     = os.environ.get("ALLY_CODE",     "")        # Your own ally code
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
 CHANNEL_ID    = int(os.environ.get("CHANNEL_ID", "0"))
 POLL_SECONDS  = int(os.environ.get("POLL_SECONDS", "30"))
+
+# ─────────────────────────────────────────────
+#  SHARD ROSTER — top 50 fleet arena ally codes
+#  (rank values here are just the initial seed; the bot tracks
+#   live rank changes itself after the first poll)
+# ─────────────────────────────────────────────
+SHARD_ALLY_CODES = [
+    "318676317",  # Ghost
+    "483636945",  # Baby Inyak
+    "254768133",  # Welderdude23
+    "182529616",  # ψβφ DDCat4
+    "739593798",  # Goat
+    "638551434",  # Shadowz
+    "543791793",  # Strider59
+    "698483912",  # Party of Fives
+    "599241583",  # Cho Manno
+    "295167858",  # Judo
+    "671495778",  # DartGvin
+    "123149486",  # Aesri
+    "614528131",  # Kreb Hue
+    "252177641",  # TheOddTimer
+    "697647618",  # MaxRebo
+    "419129292",  # Vlad Makanen
+    "848315853",  # ZoroXion
+    "479589263",  # Wanderer
+    "346368277",  # Dewitt
+    "178774198",  # RacistPumpkino
+    "388516264",  # Darklord42069
+    "346884961",  # Vaakuum
+    "449138636",  # Мора мора
+    "654196899",  # MaTheory
+    "839626799",  # CornGut2
+    "381298912",  # BarsD3
+    "693653551",  # Iroh
+    "897954862",  # Ravclaque
+    "778481551",  # BigLongCransky
+    "769259174",  # Miles
+    "653422625",  # Lyfizin Shambles
+    "217552661",  # Karp24
+    "181623514",  # Loreck Avery
+    "897942467",  # Falnewt
+    "524729348",  # Messr Keller
+    "398551717",  # Trevorious
+    "574256119",  # Anakinn
+    "627337336",  # deletraz
+    "961555632",  # markbigs702
+    "687923429",  # PunIntended
+    "521888243",  # Mol Eliza
+    "581817634",  # Erk
+    "899269912",  # Caidos
+    "848976633",  # Dаrth Vаder
+    "379394556",  # Damir
+    "939243836",  # HighOnQuack
+    "731528132",  # cam playz2932
+    "195795533",  # ISHIMURA
+    "864586854",  # DarthAledom
+    "592775641",  # LangDo44
+]
+
+# Make sure your own ally code is always included in the tracked set
+if ALLY_CODE and ALLY_CODE not in SHARD_ALLY_CODES:
+    SHARD_ALLY_CODES.append(ALLY_CODE)
 
 # ─────────────────────────────────────────────
 #  DISCORD BOT SETUP
@@ -32,90 +95,57 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 state = {
-    "my_rank": None,   # Last known fleet arena rank
-    "ready":   False,
+    "my_rank":        None,   # Your last known fleet rank
+    "last_table":      {},    # {allyCode: {"name": str, "rank": int}} from previous poll
+    "ready":           False,
 }
 
 
 # ─────────────────────────────────────────────
-#  COMLINK HELPER
+#  COMLINK HELPERS
 # ─────────────────────────────────────────────
-async def fetch_fleet_arena(session: aiohttp.ClientSession) -> dict | None:
+async def fetch_player_fleet_rank(session: aiohttp.ClientSession, ally_code: str) -> dict | None:
     """
-    Calls /playerArena and returns the fleet arena pvpProfile block (tab == 2).
-    Returns None on any failure.
-
-    The returned dict contains:
-      "rank"             -- your current fleet arena rank (int)
-      "leaderboardEntry" -- list of nearby players, each with:
-                              "id" or "playerId" : unique player ID
-                              "name"             : in-game name
-                              "rank"             : their current rank
+    Calls /player for a given ally code and extracts name + fleet arena rank.
+    Returns {"name": str, "rank": int} or None on failure.
     """
-    url = f"{COMLINK_URL}/playerArena"
+    url = f"{COMLINK_URL}/player"
     payload = {
-        "payload": {
-            "allyCode": str(ALLY_CODE),
-            "playerDetailsOnly": False,
-        },
+        "payload": {"allyCode": str(ally_code)},
         "enums": False,
     }
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
-                print(f"[WARN] /playerArena returned HTTP {resp.status}")
+                print(f"[WARN] /player ({ally_code}) returned HTTP {resp.status}")
                 return None
             data = await resp.json()
+            name = data.get("name", "Unknown Player")
 
-            # Always dump the top-level keys of the raw response so we can see
-            # exactly what this Comlink instance returns.
-            print(f"[DEBUG] Top-level response keys: {list(data.keys())}")
-
-            pvp = data.get("pvpProfile", [])
-            print(f"[DEBUG] pvpProfile has {len(pvp)} entries")
-            for p in pvp:
-                print(f"[DEBUG] pvpProfile entry keys: {list(p.keys())} | tab={p.get('tab')} rank={p.get('rank')}")
-
-            # Fleet arena is tab == 2
-            fleet_profile = None
-            for profile in pvp:
-                if profile.get("tab") == 2:
-                    fleet_profile = profile
-                    break
-
-            if fleet_profile is None:
-                print("[WARN] No fleet arena profile (tab==2) found in /playerArena response.")
-                print(f"[DEBUG] Full pvpProfile dump: {json.dumps(pvp, indent=2)[:3000]}")
-                return None
-
-            # Dump the FULL fleet profile raw JSON once, so we can see every field
-            # Comlink actually returns (leaderboardEntry, opponents, rivals, etc.)
-            if state["my_rank"] is None:
-                print(f"[DEBUG] FULL fleet pvpProfile JSON:\n{json.dumps(fleet_profile, indent=2)[:6000]}")
-
-            return fleet_profile
-
+            for profile in data.get("pvpProfile", []):
+                if profile.get("tab") == 2:  # fleet arena
+                    rank = profile.get("rank")
+                    if rank is not None:
+                        return {"name": name, "rank": rank}
+            return None
     except Exception as e:
-        print(f"[ERROR] fetch_fleet_arena: {e}")
+        print(f"[ERROR] fetch_player_fleet_rank({ally_code}): {e}")
         return None
 
 
-def find_player_at_rank(leaderboard_entries: list, target_rank: int) -> str:
+async def fetch_shard_table(session: aiohttp.ClientSession) -> dict:
     """
-    Scans leaderboardEntry list for whoever currently holds target_rank.
-    Returns their in-game name, or None if not found.
+    Fetches fleet rank for every ally code in SHARD_ALLY_CODES concurrently.
+    Returns {allyCode: {"name": str, "rank": int}}.
     """
-    for entry in leaderboard_entries:
-        entry_rank = entry.get("rank")
-        if entry_rank == target_rank:
-            # Try all known name field variants
-            name = (
-                entry.get("name")
-                or entry.get("playerName")
-                or entry.get("player_name")
-            )
-            return name or "Unknown Player"
-    return None
+    tasks_list = [fetch_player_fleet_rank(session, code) for code in SHARD_ALLY_CODES]
+    results = await asyncio.gather(*tasks_list)
+
+    table = {}
+    for code, result in zip(SHARD_ALLY_CODES, results):
+        if result is not None:
+            table[code] = result
+    return table
 
 
 # ─────────────────────────────────────────────
@@ -132,43 +162,46 @@ async def poll_fleet_rank():
         return
 
     async with aiohttp.ClientSession() as session:
-        fleet_profile = await fetch_fleet_arena(session)
-        if fleet_profile is None:
+
+        new_table = await fetch_shard_table(session)
+        if not new_table:
+            print("[WARN] Shard table fetch returned nothing — skipping this poll.")
             return
 
-        current_rank = fleet_profile.get("rank")
-        if current_rank is None:
-            print("[WARN] Fleet arena profile has no 'rank' field.")
+        my_entry = new_table.get(ALLY_CODE)
+        if my_entry is None:
+            print(f"[WARN] Your ally code {ALLY_CODE} not found in shard table this poll.")
             return
 
-        leaderboard_entries = fleet_profile.get("leaderboardEntry", [])
+        current_rank = my_entry["rank"]
         last_rank = state["my_rank"]
-
-        # Log all entries on first poll for debugging
-        if last_rank is None:
-            print(f"[INFO] First poll. Fleet rank: #{current_rank}. "
-                  f"Leaderboard entries returned: {len(leaderboard_entries)}")
-            for e in leaderboard_entries:
-                print(f"  rank={e.get('rank')} name={e.get('name') or e.get('playerName')} "
-                      f"id={e.get('id') or e.get('playerId')}")
 
         # ── First poll: establish baseline ───────────────────────────────────
         if last_rank is None:
-            state["my_rank"] = current_rank
+            state["my_rank"]    = current_rank
+            state["last_table"] = new_table
+            print(f"[INFO] Monitoring started. Fleet rank: #{current_rank}. "
+                  f"Tracking {len(new_table)} players in shard.")
             await channel.send(
                 f"🚀 **Fleet Arena Watcher is online!**\n"
                 f"Currently monitoring rank **#{current_rank}** in Fleet Arena.\n"
-                f"You'll be notified immediately when someone takes your rank."
+                f"Tracking {len(new_table)} players in your shard.\n"
+                f"You'll be notified immediately if someone attacks and takes your rank."
             )
             return
 
         # ── Rank dropped — we were attacked! ─────────────────────────────────
         if current_rank > last_rank:
-            print(f"[ALERT] Rank dropped #{last_rank} → #{current_rank}.")
-            print(f"[DEBUG] Full fleet_profile JSON at time of attack:\n{json.dumps(fleet_profile, indent=2)[:6000]}")
+            print(f"[ALERT] Rank dropped #{last_rank} → #{current_rank}. Identifying attacker...")
 
-            # The attacker is whoever now holds our old rank
-            attacker_name = find_player_at_rank(leaderboard_entries, last_rank)
+            # Find whoever is now sitting at your old rank
+            attacker_name = None
+            for code, entry in new_table.items():
+                if code == ALLY_CODE:
+                    continue
+                if entry["rank"] == last_rank:
+                    attacker_name = entry["name"]
+                    break
 
             if attacker_name:
                 await channel.send(
@@ -177,28 +210,27 @@ async def poll_fleet_rank():
                     f"📉 Your rank: **#{last_rank}** → **#{current_rank}**"
                 )
             else:
-                # This means rank {last_rank} wasn't in the leaderboardEntry list at all.
-                # Log what ranks we did get so we can diagnose.
-                ranks_present = sorted([e.get("rank") for e in leaderboard_entries if e.get("rank")])
-                print(f"[WARN] Rank #{last_rank} not found in leaderboard entries. "
-                      f"Ranks present: {ranks_present}")
+                # Whoever took your spot might be outside the tracked top 50.
                 await channel.send(
                     f"⚔️ **Fleet Arena Attack!**\n"
                     f"You were knocked from **#{last_rank}** to **#{current_rank}**.\n"
-                    f"_(Could not find rank #{last_rank} in the {len(leaderboard_entries)} "
-                    f"leaderboard entries returned — check logs for details.)_"
+                    f"_(The attacker isn't in your tracked top {len(SHARD_ALLY_CODES)} list — "
+                    f"they may have climbed from further down the shard.)_"
                 )
 
-            state["my_rank"] = current_rank
+            state["my_rank"]    = current_rank
+            state["last_table"] = new_table
 
         # ── Rank improved ─────────────────────────────────────────────────────
         elif current_rank < last_rank:
             print(f"[INFO] Rank improved: #{last_rank} → #{current_rank}")
-            state["my_rank"] = current_rank
+            state["my_rank"]    = current_rank
+            state["last_table"] = new_table
 
         # ── No change ─────────────────────────────────────────────────────────
         else:
             print(f"[INFO] Rank unchanged: #{current_rank}")
+            state["last_table"] = new_table
 
 
 @poll_fleet_rank.before_loop
@@ -226,6 +258,7 @@ async def on_ready():
     state["ready"] = True
     poll_fleet_rank.start()
     print(f"[INFO] Polling fleet arena every {POLL_SECONDS}s via {COMLINK_URL}")
+    print(f"[INFO] Tracking {len(SHARD_ALLY_CODES)} ally codes in shard roster.")
 
 
 # ─────────────────────────────────────────────
