@@ -20,7 +20,8 @@ from discord.ext import tasks
 COMLINK_URL        = os.environ.get("COMLINK_URL",        "https://comlink.andeh.uk")
 ALLY_CODE          = os.environ.get("ALLY_CODE",          "")   # Your own ally code (optional here, for context)
 DISCORD_TOKEN      = os.environ.get("DISCORD_TOKEN",      "")   # Can be the SAME bot token as bot.py, or a different one
-MOVEMENTS_CHANNEL_ID = int(os.environ.get("MOVEMENTS_CHANNEL_ID", "0"))  # Separate channel for movement alerts
+MOVEMENTS_CHANNEL_ID  = int(os.environ.get("MOVEMENTS_CHANNEL_ID", "0"))   # Primary channel (server 1)
+MOVEMENTS_CHANNEL_ID_2 = int(os.environ.get("MOVEMENTS_CHANNEL_ID_2", "0")) # Optional second channel (server 2)
 POLL_SECONDS       = int(os.environ.get("POLL_SECONDS",   "30"))
 TRACK_TOP_N        = int(os.environ.get("TRACK_TOP_N",    "30"))  # Only report movement within this rank range
 
@@ -186,17 +187,30 @@ async def fetch_shard_table(session: aiohttp.ClientSession) -> dict:
     return table
 
 
+async def broadcast_message(text: str):
+    """
+    Sends a message to both configured channels, across both servers.
+    Silently skips any channel ID that's not set (0) or not found.
+    """
+    for channel_id in (MOVEMENTS_CHANNEL_ID, MOVEMENTS_CHANNEL_ID_2):
+        if channel_id == 0:
+            continue
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            print(f"[WARN] Cannot find channel ID {channel_id} — bot may not be invited to that server.")
+            continue
+        try:
+            await channel.send(text)
+        except Exception as e:
+            print(f"[ERROR] Failed to send to channel {channel_id}: {e}")
+
+
 # ─────────────────────────────────────────────
 #  POLLING LOOP
 # ─────────────────────────────────────────────
 @tasks.loop(seconds=POLL_SECONDS)
 async def poll_movements():
     if not state["ready"]:
-        return
-
-    channel = client.get_channel(MOVEMENTS_CHANNEL_ID)
-    if channel is None:
-        print(f"[ERROR] Cannot find Discord channel ID {MOVEMENTS_CHANNEL_ID}.")
         return
 
     async with aiohttp.ClientSession() as session:
@@ -213,7 +227,7 @@ async def poll_movements():
             state["last_table"] = new_table
             tracked_in_range = sum(1 for e in new_table.values() if e["rank"] <= TRACK_TOP_N)
             print(f"[INFO] Movement tracking started. {tracked_in_range} players currently in top {TRACK_TOP_N}.")
-            await channel.send(
+            await broadcast_message(
                 f"📊 **Fleet Arena Movement Tracker is online!**\n"
                 f"Watching the top **{TRACK_TOP_N}** ranks across {len(new_table)} tracked players.\n"
                 f"You'll see a message for every individual rank change."
@@ -271,7 +285,7 @@ async def poll_movements():
                 plausible = could_have_reached(w_old_rank, w_new_rank)
                 range_note = "" if plausible else " _(unusual range — verify)_"
 
-                await channel.send(
+                await broadcast_message(
                     f"⚔️ **{w_name}** (#{w_old_rank} → **#{w_new_rank}**) defeated "
                     f"**{l_name}**, who dropped to **#{l_new_rank}**{range_note}"
                 )
@@ -283,7 +297,7 @@ async def poll_movements():
 
         # Report any winners we couldn't pair with a specific loser
         for name, old_rank, new_rank in unpaired_winners:
-            await channel.send(
+            await broadcast_message(
                 f"📈 **{name}** moved up: **#{old_rank}** → **#{new_rank}** "
                 f"_(opponent not in tracked top {len(SHARD_ALLY_CODES)})_"
             )
@@ -293,7 +307,7 @@ async def poll_movements():
         for old_rank, (l_code, l_name, l_old_rank, l_new_rank) in losers_by_old_rank.items():
             if l_code in reported_loser_codes:
                 continue
-            await channel.send(
+            await broadcast_message(
                 f"📉 **{l_name}** moved down: **#{l_old_rank}** → **#{l_new_rank}** "
                 f"_(attacker not in tracked top {len(SHARD_ALLY_CODES)})_"
             )
@@ -319,8 +333,8 @@ async def before_poll():
 async def on_ready():
     print(f"[INFO] Logged in as {client.user}")
 
-    if MOVEMENTS_CHANNEL_ID == 0:
-        print("[ERROR] Missing MOVEMENTS_CHANNEL_ID environment variable.")
+    if MOVEMENTS_CHANNEL_ID == 0 and MOVEMENTS_CHANNEL_ID_2 == 0:
+        print("[ERROR] No channel configured — set MOVEMENTS_CHANNEL_ID and/or MOVEMENTS_CHANNEL_ID_2.")
         await client.close()
         return
 
