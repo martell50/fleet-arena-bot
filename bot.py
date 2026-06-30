@@ -9,6 +9,7 @@ is guaranteed to still be there on the next poll.
 """
 
 import os
+import json
 import asyncio
 import aiohttp
 import discord
@@ -66,23 +67,33 @@ async def fetch_fleet_arena(session: aiohttp.ClientSession) -> dict | None:
                 return None
             data = await resp.json()
 
-            # Log the raw response structure once so we can debug field names
-            if state["my_rank"] is None:
-                pvp = data.get("pvpProfile", [])
-                for p in pvp:
-                    tab = p.get("tab")
-                    entries = p.get("leaderboardEntry", [])
-                    sample = entries[0] if entries else {}
-                    print(f"[DEBUG] tab={tab} rank={p.get('rank')} "
-                          f"entries_count={len(entries)} sample_entry_keys={list(sample.keys())}")
+            # Always dump the top-level keys of the raw response so we can see
+            # exactly what this Comlink instance returns.
+            print(f"[DEBUG] Top-level response keys: {list(data.keys())}")
+
+            pvp = data.get("pvpProfile", [])
+            print(f"[DEBUG] pvpProfile has {len(pvp)} entries")
+            for p in pvp:
+                print(f"[DEBUG] pvpProfile entry keys: {list(p.keys())} | tab={p.get('tab')} rank={p.get('rank')}")
 
             # Fleet arena is tab == 2
-            for profile in data.get("pvpProfile", []):
+            fleet_profile = None
+            for profile in pvp:
                 if profile.get("tab") == 2:
-                    return profile
+                    fleet_profile = profile
+                    break
 
-            print("[WARN] No fleet arena profile (tab==2) found in /playerArena response.")
-            return None
+            if fleet_profile is None:
+                print("[WARN] No fleet arena profile (tab==2) found in /playerArena response.")
+                print(f"[DEBUG] Full pvpProfile dump: {json.dumps(pvp, indent=2)[:3000]}")
+                return None
+
+            # Dump the FULL fleet profile raw JSON once, so we can see every field
+            # Comlink actually returns (leaderboardEntry, opponents, rivals, etc.)
+            if state["my_rank"] is None:
+                print(f"[DEBUG] FULL fleet pvpProfile JSON:\n{json.dumps(fleet_profile, indent=2)[:6000]}")
+
+            return fleet_profile
 
     except Exception as e:
         print(f"[ERROR] fetch_fleet_arena: {e}")
@@ -154,9 +165,7 @@ async def poll_fleet_rank():
         # ── Rank dropped — we were attacked! ─────────────────────────────────
         if current_rank > last_rank:
             print(f"[ALERT] Rank dropped #{last_rank} → #{current_rank}.")
-            print(f"[DEBUG] Leaderboard entries this poll: {len(leaderboard_entries)}")
-            for e in leaderboard_entries:
-                print(f"  rank={e.get('rank')} name={e.get('name') or e.get('playerName')}")
+            print(f"[DEBUG] Full fleet_profile JSON at time of attack:\n{json.dumps(fleet_profile, indent=2)[:6000]}")
 
             # The attacker is whoever now holds our old rank
             attacker_name = find_player_at_rank(leaderboard_entries, last_rank)
