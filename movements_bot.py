@@ -235,12 +235,13 @@ async def poll_movements():
             return
 
         # ── Compare old vs new table, pair winners with losers ───────────────
-        # A "winner" is anyone who climbed to a better (lower-numbered) rank.
-        # The "loser" of that exact battle is whoever now sits at the winner's
-        # OLD rank (since fleet arena swaps are 1-to-1: winner takes loser's
-        # spot, loser is bumped down to roughly the winner's old spot).
-        winners = []  # (code, name, old_rank, new_rank)
-        losers_by_old_rank = {}  # old_rank (winner's target) -> (code, name, old_rank, new_rank)
+        # CONFIRMED RULE: fleet arena swaps are an isolated 1-to-1 exchange.
+        # The winner takes the loser's exact old rank, and the loser takes
+        # the winner's exact old rank. Nothing else in the leaderboard shifts.
+        # So a valid pair must satisfy BOTH:
+        #     winner.new_rank == loser.old_rank
+        #     loser.new_rank  == winner.old_rank
+        movers = []  # (code, name, old_rank, new_rank, is_winner)
 
         for code, new_entry in new_table.items():
             old_entry = last_table.get(code)
@@ -257,62 +258,63 @@ async def poll_movements():
             if not touches_range:
                 continue
 
-            if new_rank < old_rank:
-                # Climbed up — this player WON a battle
-                winners.append((code, new_entry["name"], old_rank, new_rank))
-            else:
-                # Dropped down — this player LOST a battle
-                # Index losers by the rank they used to hold, since that's
-                # the rank a winner would have targeted.
-                losers_by_old_rank[old_rank] = (code, new_entry["name"], old_rank, new_rank)
+            is_winner = new_rank < old_rank
+            movers.append((code, new_entry["name"], old_rank, new_rank, is_winner))
 
-        # Sort winners by their new (best) rank for readable ordering
-        winners.sort(key=lambda w: w[3])
+        winners = [m for m in movers if m[4]]
+        losers  = [m for m in movers if not m[4]]
+        winners.sort(key=lambda w: w[3])  # best new rank first, for readable order
 
-        reported_loser_codes = set()
+        matched_codes = set()
         unpaired_winners = []
+        unpaired_losers = []
 
-        for w_code, w_name, w_old_rank, w_new_rank in winners:
-            # The loser of this battle should now be wherever the winner used
-            # to be (winner's old rank == loser's new resting spot in most
-            # fleet arena swap implementations) OR simply whoever previously
-            # held the winner's new rank.
-            loser = losers_by_old_rank.get(w_new_rank)
+        for w_code, w_name, w_old_rank, w_new_rank, _ in winners:
+            # Find the exact swap partner: someone who went FROM the winner's
+            # new rank TO the winner's old rank. Strict match, no fallback.
+            partner = next(
+                (l for l in losers
+                 if l[0] not in matched_codes
+                 and l[2] == w_new_rank      # loser's old_rank == winner's new_rank
+                 and l[3] == w_old_rank),    # loser's new_rank == winner's old_rank
+                None
+            )
 
-            if loser:
-                l_code, l_name, l_old_rank, l_new_rank = loser
-                # Validate against the attack range rules
-                plausible = could_have_reached(w_old_rank, w_new_rank)
-                range_note = "" if plausible else " _(unusual range — verify)_"
+            if partner:
+                l_code, l_name, l_old_rank, l_new_rank, _ = partner
+                matched_codes.add(w_code)
+                matched_codes.add(l_code)
 
                 await broadcast_message(
                     f"⚔️ **{w_name}** (#{w_old_rank} → **#{w_new_rank}**) defeated "
-                    f"**{l_name}**, who dropped to **#{l_new_rank}**{range_note}"
+                    f"**{l_name}**, who dropped to **#{l_new_rank}**"
                 )
-                reported_loser_codes.add(l_code)
             else:
-                # No matching loser found in our tracked set — they may be
-                # outside the top 50, or moved in a way we can't pair cleanly.
                 unpaired_winners.append((w_name, w_old_rank, w_new_rank))
 
-        # Report any winners we couldn't pair with a specific loser
+        # Anyone who dropped but wasn't claimed as a swap partner
+        for l_code, l_name, l_old_rank, l_new_rank, _ in losers:
+            if l_code in matched_codes:
+                continue
+            unpaired_losers.append((l_name, l_old_rank, l_new_rank))
+
+        # Report unpaired winners (their opponent isn't in our tracked set,
+        # or the swap partner's data didn't line up exactly)
         for name, old_rank, new_rank in unpaired_winners:
             await broadcast_message(
                 f"📈 **{name}** moved up: **#{old_rank}** → **#{new_rank}** "
                 f"_(opponent not in tracked top {len(SHARD_ALLY_CODES)})_"
             )
 
-        # Report any losers who weren't matched to a winner we found
-        # (e.g. their attacker is outside the tracked ally code list)
-        for old_rank, (l_code, l_name, l_old_rank, l_new_rank) in losers_by_old_rank.items():
-            if l_code in reported_loser_codes:
-                continue
+        # Report unpaired losers (their attacker isn't in our tracked set,
+        # or the swap partner's data didn't line up exactly)
+        for name, old_rank, new_rank in unpaired_losers:
             await broadcast_message(
-                f"📉 **{l_name}** moved down: **#{l_old_rank}** → **#{l_new_rank}** "
+                f"📉 **{name}** moved down: **#{old_rank}** → **#{new_rank}** "
                 f"_(attacker not in tracked top {len(SHARD_ALLY_CODES)})_"
             )
 
-        total_events = len(winners) + len([1 for r in losers_by_old_rank if losers_by_old_rank[r][0] not in reported_loser_codes])
+        total_events = len(winners) + len(losers)
         if total_events:
             print(f"[INFO] Reported movement for this poll: {len(winners)} winner(s) processed.")
         else:
