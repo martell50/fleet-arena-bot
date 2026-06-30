@@ -88,6 +88,62 @@ if ALLY_CODE and ALLY_CODE not in SHARD_ALLY_CODES:
     SHARD_ALLY_CODES.append(ALLY_CODE)
 
 # ─────────────────────────────────────────────
+#  FLEET ARENA ATTACK RANGE TABLE
+#  Maps an attacker's rank -> the best (lowest number) rank they can reach.
+#  Used to sanity-check that a detected "attacker" was actually capable
+#  of reaching your old rank, filtering out coincidental rank changes.
+# ─────────────────────────────────────────────
+def max_reachable_rank(attacker_rank: int) -> int:
+    """
+    Returns the best (numerically lowest) rank a player at attacker_rank
+    could realistically have attacked into, based on observed shard rules.
+    """
+    if attacker_rank >= 28:
+        return 21
+    if attacker_rank == 21:
+        return 15
+    if attacker_rank == 20:
+        return 14
+    if attacker_rank == 19:
+        return 13
+    if attacker_rank == 18:
+        return 13
+    if attacker_rank == 17:
+        return 12
+    if attacker_rank == 16:
+        return 11
+    if attacker_rank == 15:
+        return 10
+    if attacker_rank == 14:
+        return 9
+    if attacker_rank == 13:
+        return 8
+    if attacker_rank == 12:
+        return 8
+    if attacker_rank == 11:
+        return 7
+    if attacker_rank == 10:
+        return 6
+    if attacker_rank == 9:
+        return 5
+    if attacker_rank == 8:
+        return 4
+    if attacker_rank == 7:
+        return 3
+    if attacker_rank == 6:
+        return 2
+    if attacker_rank <= 5:
+        return 1
+    # Anything between 22-27 isn't explicitly defined; fall back to a
+    # conservative linear estimate consistent with the surrounding values.
+    return max(1, attacker_rank - 7)
+
+
+def could_have_reached(attacker_old_rank: int, target_rank: int) -> bool:
+    """True if a player starting at attacker_old_rank could attack target_rank."""
+    return max_reachable_rank(attacker_old_rank) <= target_rank <= attacker_old_rank
+
+# ─────────────────────────────────────────────
 #  DISCORD BOT SETUP
 # ─────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -196,18 +252,34 @@ async def poll_fleet_rank():
 
             # Find whoever is now sitting at your old rank
             attacker_name = None
+            attacker_old_rank = None
             for code, entry in new_table.items():
                 if code == ALLY_CODE:
                     continue
                 if entry["rank"] == last_rank:
                     attacker_name = entry["name"]
+                    # Look up where they were last poll, to sanity-check range
+                    prev_entry = state["last_table"].get(code)
+                    attacker_old_rank = prev_entry["rank"] if prev_entry else None
                     break
+
+            # Sanity-check using the attack range table, if we know their old rank
+            range_note = ""
+            if attacker_name and attacker_old_rank is not None:
+                if could_have_reached(attacker_old_rank, last_rank):
+                    range_note = ""  # plausible, no need to flag
+                else:
+                    range_note = (
+                        f"\n_(Note: based on rank #{attacker_old_rank}, this attack range is "
+                        f"unusual — double check if this seems off.)_"
+                    )
 
             if attacker_name:
                 await channel.send(
                     f"⚔️ **Fleet Arena Attack!**\n"
                     f"**{attacker_name}** knocked you out!\n"
                     f"📉 Your rank: **#{last_rank}** → **#{current_rank}**"
+                    f"{range_note}"
                 )
             else:
                 # Whoever took your spot might be outside the tracked top 50.
